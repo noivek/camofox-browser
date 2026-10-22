@@ -6,6 +6,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import { expandMacro } from './lib/macros.js';
+import { assertNavigableUrl, isRequestAllowed } from './lib/url-guard.js';
 import { loadConfig } from './lib/config.js';
 import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/proxy.js';
 import { createFlyHelpers } from './lib/fly.js';
@@ -707,7 +708,7 @@ async function probeGoogleSearch(candidateBrowser) {
   let context = null;
   try {
     context = await candidateBrowser.newContext({
-      viewport: { width: 1280, height: 720 },
+      noDefaultViewport: true,
       permissions: ['geolocation'],
     });
     const page = await context.newPage();
@@ -1177,7 +1178,7 @@ async function getSession(userId, { trace = false } = {}) {
       }
       const b = await ensureBrowser();
       const contextOptions = {
-        viewport: { width: 1280, height: 720 },
+        noDefaultViewport: true,
         permissions: ['geolocation'],
       };
       // When geoip is active (proxy configured), camoufox auto-configures
@@ -1199,6 +1200,18 @@ async function getSession(userId, { trace = false } = {}) {
       }
       await pluginEvents.emitAsync('session:creating', { userId: key, contextOptions });
       const context = await b.newContext(contextOptions);
+
+      // Server-side URL guard: intercept every request in this context
+      // (covers redirects, popups, subresources), not just explicit navigations.
+      if (CONFIG.urlGuardEnabled) {
+        await context.route('**/*', (route) => {
+          if (isRequestAllowed(route.request().url(), { allowHosts: CONFIG.urlGuardAllowHosts })) {
+            return route.continue();
+          }
+          log('warn', 'url guard blocked request', { userId: key, url: route.request().url() });
+          return route.abort();
+        });
+      }
 
       let tracePath = null;
       if (trace) {
@@ -2622,7 +2635,9 @@ app.post('/tabs', async (req, res) => {
       refreshActiveTabsGauge();
       
       if (url) {
-        const urlErr = validateUrl(url);
+        const urlErr = CONFIG.urlGuardEnabled
+          ? await assertNavigableUrl(url, { allowHosts: CONFIG.urlGuardAllowHosts })
+          : validateUrl(url);
         if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
         tabState.lastRequestedUrl = url;
         try {
@@ -2766,7 +2781,9 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
       
       if (!targetUrl) throw new Error('url or macro required');
       
-      const urlErr = validateUrl(targetUrl);
+      const urlErr = CONFIG.urlGuardEnabled
+        ? await assertNavigableUrl(targetUrl, { allowHosts: CONFIG.urlGuardAllowHosts })
+        : validateUrl(targetUrl);
       if (urlErr) throw new Error(urlErr);
       
       return await withTabLock(tabId, async () => {
@@ -5294,9 +5311,11 @@ app.post('/tabs/open', async (req, res) => {
       return res.status(400).json({ error: 'url is required' });
     }
     
-    const urlErr = validateUrl(url);
+    const urlErr = CONFIG.urlGuardEnabled
+      ? await assertNavigableUrl(url, { allowHosts: CONFIG.urlGuardAllowHosts })
+      : validateUrl(url);
     if (urlErr) return res.status(400).json({ error: urlErr });
-    
+
     let session = await getSession(userId);
     
     // Recycle oldest tab when limits are reached instead of rejecting
@@ -5496,9 +5515,11 @@ app.post('/navigate', async (req, res) => {
       return res.status(400).json({ error: 'url is required' });
     }
     
-    const urlErr = validateUrl(url);
+    const urlErr = CONFIG.urlGuardEnabled
+      ? await assertNavigableUrl(url, { allowHosts: CONFIG.urlGuardAllowHosts })
+      : validateUrl(url);
     if (urlErr) return res.status(400).json({ error: urlErr });
-    
+
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, targetId);
     if (!found) {
