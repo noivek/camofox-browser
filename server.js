@@ -1284,6 +1284,12 @@ function isProxyError(err) {
 function handleRouteError(err, req, res, extraFields = {}) {
   const failureType = classifyError(err);
   const action = actionFromReq(req);
+
+  // Caller-supplied 4xx status codes are intentional client errors (url guard
+  // 400, trace 409, tab cap 429) — honor them before generic classification.
+  if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
+    return res.status(err.statusCode).json({ error: err.message, code: err.code || 'request_rejected' });
+  }
   failuresTotal.labels(failureType, action).inc();
 
   const userId = req.body?.userId || req.query?.userId;
